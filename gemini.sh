@@ -541,8 +541,15 @@ test_conn() {
 
 domains() {
     need_root
+    before_hash=$(sha256sum "$DOMAIN_FILE" 2>/dev/null | awk '{print $1}')
     ${EDITOR:-nano} "$DOMAIN_FILE"
-    refresh
+    after_hash=$(sha256sum "$DOMAIN_FILE" 2>/dev/null | awk '{print $1}')
+    if [ "$before_hash" != "$after_hash" ]; then
+        echo -e "${CYAN}检测到配置变更，正在刷新...${NC}"
+        refresh
+    else
+        echo -e "${YELLOW}配置未变化，跳过刷新${NC}"
+    fi
 }
 
 uninstall() {
