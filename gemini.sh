@@ -294,7 +294,8 @@ write_dnsmasq_conf() {
 parse_targets() {
     : > "$STATIC_TMP"
     : > "$DOMAINS_TMP"
-    [ -f "$DOMAIN_FILE" ] || return 0
+    [ -f "$DOMAIN_FILE" ] || return 2
+    [ -r "$DOMAIN_FILE" ] || return 3
     while read -r entry; do
         entry=$(echo "$entry" | sed 's/#.*//' | xargs)
         [ -z "$entry" ] && continue
@@ -354,13 +355,28 @@ DOMAINS_TMP="$WORKDIR/domains.txt"
 DYNAMIC_IP_TMP="$WORKDIR/dynamic_ips.txt"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-parse_targets
+parse_rc=0
+parse_targets || parse_rc=$?
+if [ "$parse_rc" -eq 2 ]; then
+    log "skip: config file not found: ${DOMAIN_FILE}"
+    exit 0
+fi
+if [ "$parse_rc" -eq 3 ]; then
+    log "skip: config file unreadable: ${DOMAIN_FILE}"
+    exit 0
+fi
+
+static_count=$(wc -l < "$STATIC_TMP" 2>/dev/null || echo 0)
+domain_count=$(wc -l < "$DOMAINS_TMP" 2>/dev/null || echo 0)
+if [ "$static_count" -eq 0 ] && [ "$domain_count" -eq 0 ]; then
+    log "skip: parsed 0 targets, keep existing ipset to avoid accidental wipe"
+    exit 0
+fi
+
 write_dnsmasq_conf
 resolve_domains_to_file
 rebuild_ipset
 
-static_count=$(wc -l < "$STATIC_TMP" 2>/dev/null || echo 0)
-domain_count=$(wc -l < "$DOMAINS_TMP" 2>/dev/null || echo 0)
 dynamic_count=$(wc -l < "$DYNAMIC_IP_TMP" 2>/dev/null || echo 0)
 log "refreshed $(ipset list "$IPSET_NAME" 2>/dev/null | awk '/Number of entries:/ {print $4}') entries"
 log "static_nets=${static_count} domains=${domain_count} resolved_ipv4=${dynamic_count}"
