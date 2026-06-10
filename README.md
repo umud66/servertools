@@ -19,7 +19,7 @@
 - 安装并配置 `trojan-go`
   - 使用域名证书
   - 支持配置伪装回落地址和端口
-  - 自动生成 WebSocket 配置
+  - WebSocket 可选配置
 - 安装并配置 `hysteria2`
   - 直接填写域名、邮箱、密码
   - 使用 Hysteria2 内置 ACME 自动签发证书
@@ -28,12 +28,22 @@
 ## 文件
 
 - `deploy_server.sh`：主脚本
+- `subscription_tool.html`：本地订阅生成工具
+  - 支持编辑已添加节点
+  - 支持导入 `trojan://`、`hysteria2://` 分享链接
+- `subscription-worker/`：Cloudflare Worker 订阅分发服务，支持 D1 存储和 Passkey 管理后台
 
 ## 使用方法
 
 ```bash
 chmod +x deploy_server.sh
 sudo ./deploy_server.sh
+```
+
+订阅生成工具可直接用浏览器打开：
+
+```bash
+open subscription_tool.html
 ```
 
 ## 推荐部署流程
