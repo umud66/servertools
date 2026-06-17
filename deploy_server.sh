@@ -804,6 +804,85 @@ install_bbr_acceleration_safe() {
     safe_run "install-bbr" install_bbr_acceleration
 }
 
+show_ipv6_status() {
+    local all_disabled default_disabled lo_disabled ipv6_addr_summary
+    all_disabled="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo "unknown")"
+    default_disabled="$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null || echo "unknown")"
+    lo_disabled="$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null || echo "unknown")"
+    ipv6_addr_summary="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6 / {print $2}' | paste -sd ', ' -)"
+
+    echo "==== IPv6 状态 ===="
+    echo "all.disable_ipv6: ${all_disabled}"
+    echo "default.disable_ipv6: ${default_disabled}"
+    echo "lo.disable_ipv6: ${lo_disabled}"
+    if [[ "$all_disabled" == "1" && "$default_disabled" == "1" ]]; then
+        echo "当前状态: 已关闭"
+    elif [[ "$all_disabled" == "0" && "$default_disabled" == "0" ]]; then
+        echo "当前状态: 已开启"
+    else
+        echo "当前状态: 部分开启/部分关闭"
+    fi
+    echo "全局 IPv6 地址: ${ipv6_addr_summary:-未检测到}"
+}
+
+set_ipv6_state() {
+    local state="$1"
+    local sysctl_file
+    sysctl_file="/etc/sysctl.d/99-server-deploy-tool-ipv6.conf"
+
+    case "$state" in
+        enable)
+            cat > "$sysctl_file" <<'EOF'
+net.ipv6.conf.all.disable_ipv6=0
+net.ipv6.conf.default.disable_ipv6=0
+net.ipv6.conf.lo.disable_ipv6=0
+EOF
+            ;;
+        disable)
+            cat > "$sysctl_file" <<'EOF'
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+net.ipv6.conf.lo.disable_ipv6=1
+EOF
+            ;;
+        *)
+            log_error "未知 IPv6 状态: $state"
+            return 1
+            ;;
+    esac
+
+    if ! sysctl --system >/dev/null; then
+        log_error "sysctl 应用失败"
+        return 1
+    fi
+
+    if [[ "$state" == "enable" ]]; then
+        log_ok "IPv6 已开启"
+    else
+        log_ok "IPv6 已关闭"
+    fi
+}
+
+ipv6_menu() {
+    while true; do
+        show_banner
+        echo "IPv6 管理"
+        echo "[1] 查看 IPv6 状态"
+        echo "[2] 开启 IPv6"
+        echo "[3] 关闭 IPv6"
+        echo "[0] 返回主菜单"
+        read -r -p "请选择: " choice
+
+        case "$choice" in
+            1) show_ipv6_status; pause_wait ;;
+            2) set_ipv6_state enable; pause_wait ;;
+            3) set_ipv6_state disable; pause_wait ;;
+            0) return 0 ;;
+            *) log_warn "无效选择"; pause_wait ;;
+        esac
+    done
+}
+
 show_bbr_status() {
     local kernel_version available_controls current_control current_qdisc loaded_module
     kernel_version="$(uname -r)"
@@ -1132,6 +1211,8 @@ show_status() {
     echo
     show_bbr_status
     echo
+    show_ipv6_status
+    echo
     echo "日志文件: $LOG_FILE"
 }
 
@@ -1286,13 +1367,14 @@ main_menu() {
         echo "[1] 优化 Ubuntu 软件源"
         echo "[2] 安装基础依赖"
         echo "[3] 安装/启用 BBR"
-        echo "[4] 域名与证书管理"
-        echo "[5] Trojan-Go 管理"
-        echo "[6] Hysteria2 管理"
-        echo "[7] 保护检查"
-        echo "[8] 查看当前状态"
-        echo "[9] 测试工具"
-        echo "[10] 快速部署向导"
+        echo "[4] IPv6 管理"
+        echo "[5] 域名与证书管理"
+        echo "[6] Trojan-Go 管理"
+        echo "[7] Hysteria2 管理"
+        echo "[8] 保护检查"
+        echo "[9] 查看当前状态"
+        echo "[10] 测试工具"
+        echo "[11] 快速部署向导"
         echo "[0] 退出"
         read -r -p "请选择: " choice
 
@@ -1300,13 +1382,14 @@ main_menu() {
             1) optimize_ubuntu_sources; pause_wait ;;
             2) install_base_packages_safe; pause_wait ;;
             3) install_bbr_acceleration_safe; pause_wait ;;
-            4) domain_menu ;;
-            5) trojan_menu ;;
-            6) hysteria_menu ;;
-            7) protection_menu ;;
-            8) show_status; pause_wait ;;
-            9) test_tools_menu ;;
-            10) quick_wizard; pause_wait ;;
+            4) ipv6_menu ;;
+            5) domain_menu ;;
+            6) trojan_menu ;;
+            7) hysteria_menu ;;
+            8) protection_menu ;;
+            9) show_status; pause_wait ;;
+            10) test_tools_menu ;;
+            11) quick_wizard; pause_wait ;;
             0) exit 0 ;;
             *) log_warn "无效选择"; pause_wait ;;
         esac

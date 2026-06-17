@@ -15,7 +15,6 @@ NC='\033[0m'
 WARP_SOCKS_PORT="40000"
 REDSOCKS_PORT="12345"
 REDSOCKS_CONF="/etc/redsocks-warp-gemini.conf"
-REDSOCKS_SERVICE="warp-gemini-redsocks.service"
 IPSET_NAME="WARP_GEMINI"
 NAT_CHAIN="WARP_GEMINI"
 DOMAIN_FILE="/etc/warp-gemini-domains.conf"
@@ -24,7 +23,6 @@ REFRESH_SCRIPT="/usr/local/bin/warp-gemini-refresh"
 CONTROL_SCRIPT="/usr/local/bin/warp-gemini"
 COMPAT_SCRIPT="/usr/local/bin/warp"
 SERVICE_FILE="/etc/systemd/system/warp-gemini.service"
-REDSOCKS_SERVICE_FILE="/etc/systemd/system/warp-gemini-redsocks.service"
 REFRESH_SERVICE="/etc/systemd/system/warp-gemini-refresh.service"
 REFRESH_TIMER="/etc/systemd/system/warp-gemini-refresh.timer"
 GAI_MARKER="# added-by-warp-gemini-domain-script"
@@ -70,7 +68,7 @@ ${CYAN}[1/6] 安装依赖...${NC}"
         ubuntu|debian)
             # Debian/Ubuntu 的 redsocks 包安装时可能自动拉起原生 redsocks.service，
             # 但默认配置经常导致 ExecStartPre 校验失败。这里临时禁止 postinst 启动服务，
-            # 后续只使用本脚本自己的 warp-gemini-redsocks.service。
+            # 后续只由本脚本统一管理 redsocks 进程。
             POLICY_BACKUP=""
             if [ -e /usr/sbin/policy-rc.d ]; then
                 POLICY_BACKUP="/usr/sbin/policy-rc.d.warp-gemini.bak.$(date +%s)"
@@ -254,6 +252,7 @@ set -o pipefail
 IPSET_NAME="WARP_GEMINI"
 DOMAIN_FILE="/etc/warp-gemini-domains.conf"
 DNSMASQ_CONF="/etc/dnsmasq.d/warp-gemini.conf"
+CACHE_FILE="/var/lib/warp-gemini-dynamic-ips.txt"
 
 log() { echo "[warp-gemini-refresh] $*"; }
 
@@ -261,11 +260,12 @@ ensure_hash_net_set() {
     local set_name="$1"
     if ipset list "$set_name" >/dev/null 2>&1; then
         current_type=$(ipset list "$set_name" 2>/dev/null | awk -F': ' '/^Type:/ {print $2}')
-        if [ "$current_type" != "hash:net" ]; then
+        current_header=$(ipset list "$set_name" 2>/dev/null | awk -F': ' '/^Header:/ {print $2}')
+        if [ "$current_type" != "hash:net" ] || echo "$current_header" | grep -Eq '(^| )timeout [1-9][0-9]*'; then
             ipset destroy "$set_name" >/dev/null 2>&1 || true
         fi
     fi
-    ipset create "$set_name" hash:net family inet timeout 1800 -exist
+    ipset create "$set_name" hash:net family inet timeout 0 -exist
 }
 
 is_ipv4() {
@@ -340,6 +340,21 @@ resolve_domains_to_file() {
     sort -u -o "$DYNAMIC_IP_TMP" "$DYNAMIC_IP_TMP"
 }
 
+restore_cached_dynamic_ips() {
+    if [ -s "$CACHE_FILE" ]; then
+        cp "$CACHE_FILE" "$DYNAMIC_IP_TMP"
+        sort -u -o "$DYNAMIC_IP_TMP" "$DYNAMIC_IP_TMP"
+        log "restore cached dynamic ips from ${CACHE_FILE}"
+        return 0
+    fi
+    return 1
+}
+
+save_cached_dynamic_ips() {
+    mkdir -p "$(dirname "$CACHE_FILE")"
+    cp "$DYNAMIC_IP_TMP" "$CACHE_FILE"
+}
+
 rebuild_ipset() {
     TMP_IPSET_NAME="${IPSET_NAME}_TMP"
     ensure_hash_net_set "$IPSET_NAME"
@@ -353,7 +368,7 @@ rebuild_ipset() {
 
     while read -r ip; do
         [ -z "$ip" ] && continue
-        ipset add "$TMP_IPSET_NAME" "$ip" timeout 1800 -exist 2>/dev/null || true
+        ipset add "$TMP_IPSET_NAME" "$ip" timeout 0 -exist 2>/dev/null || true
     done < "$DYNAMIC_IP_TMP"
 
     ipset swap "$TMP_IPSET_NAME" "$IPSET_NAME" >/dev/null 2>&1 || true
@@ -386,9 +401,20 @@ fi
 
 write_dnsmasq_conf
 resolve_domains_to_file
-rebuild_ipset
-
 dynamic_count=$(wc -l < "$DYNAMIC_IP_TMP" 2>/dev/null || echo 0)
+if [ "$domain_count" -gt 0 ] && [ "$dynamic_count" -eq 0 ]; then
+    if restore_cached_dynamic_ips; then
+        dynamic_count=$(wc -l < "$DYNAMIC_IP_TMP" 2>/dev/null || echo 0)
+    else
+        log "skip: resolved 0 ipv4 from ${domain_count} domains, keep existing ipset to avoid accidental wipe"
+        exit 0
+    fi
+fi
+rebuild_ipset
+if [ "$dynamic_count" -gt 0 ]; then
+    save_cached_dynamic_ips
+fi
+
 log "refreshed $(ipset list "$IPSET_NAME" 2>/dev/null | awk '/Number of entries:/ {print $4}') entries"
 log "static_nets=${static_count} domains=${domain_count} resolved_ipv4=${dynamic_count}"
 SCRIPT
@@ -408,7 +434,6 @@ NC='\033[0m'
 WARP_SOCKS_PORT="40000"
 REDSOCKS_PORT="12345"
 REDSOCKS_CONF="/etc/redsocks-warp-gemini.conf"
-REDSOCKS_SERVICE="warp-gemini-redsocks.service"
 IPSET_NAME="WARP_GEMINI"
 NAT_CHAIN="WARP_GEMINI"
 DOMAIN_FILE="/etc/warp-gemini-domains.conf"
@@ -422,34 +447,29 @@ need_root() {
 }
 
 ensure_ipset() {
-    # 兼容旧版本 hash:ip：自动重建为 hash:net，确保支持 CIDR。
     if ipset list "$IPSET_NAME" >/dev/null 2>&1; then
         current_type=$(ipset list "$IPSET_NAME" 2>/dev/null | awk -F': ' '/^Type:/ {print $2}')
-        if [ "$current_type" != "hash:net" ]; then
+        current_header=$(ipset list "$IPSET_NAME" 2>/dev/null | awk -F': ' '/^Header:/ {print $2}')
+        if [ "$current_type" != "hash:net" ] || echo "$current_header" | grep -Eq '(^| )timeout [1-9][0-9]*'; then
             ipset destroy "$IPSET_NAME" >/dev/null 2>&1 || true
         fi
     fi
-    ipset create "$IPSET_NAME" hash:net family inet timeout 1800 -exist
+    ipset create "$IPSET_NAME" hash:net family inet timeout 0 -exist
 }
 
 start_redsocks() {
-    systemctl disable --now redsocks.service >/dev/null 2>&1 || true
-    systemctl mask redsocks.service >/dev/null 2>&1 || true
-
     if ! redsocks -t -c "$REDSOCKS_CONF" >/tmp/warp-gemini-redsocks-test.log 2>&1; then
         echo -e "${RED}redsocks 配置校验失败：$REDSOCKS_CONF${NC}"
         cat /tmp/warp-gemini-redsocks-test.log
         exit 1
     fi
 
-    systemctl restart "$REDSOCKS_SERVICE" >/dev/null 2>&1 || {
-        pkill redsocks >/dev/null 2>&1 || true
-        nohup redsocks -c "$REDSOCKS_CONF" >/var/log/warp-gemini-redsocks.log 2>&1 &
-        sleep 1
-    }
+    pkill redsocks >/dev/null 2>&1 || true
+    nohup redsocks -c "$REDSOCKS_CONF" >/var/log/warp-gemini-redsocks.log 2>&1 &
+    sleep 1
 
     if ! pgrep -x redsocks >/dev/null 2>&1; then
-        echo -e "${RED}redsocks 启动失败，请查看：journalctl -xeu ${REDSOCKS_SERVICE}${NC}"
+        echo -e "${RED}redsocks 启动失败，请查看：/var/log/warp-gemini-redsocks.log${NC}"
         exit 1
     fi
 }
@@ -478,14 +498,8 @@ remove_iptables() {
     while iptables -t nat -C OUTPUT -p tcp -j "$NAT_CHAIN" 2>/dev/null; do
         iptables -t nat -D OUTPUT -p tcp -j "$NAT_CHAIN" 2>/dev/null || break
     done
-    # 兼容旧版本没有 -p tcp 的跳转规则。
-    while iptables -t nat -C OUTPUT -j "$NAT_CHAIN" 2>/dev/null; do
-        iptables -t nat -D OUTPUT -j "$NAT_CHAIN" 2>/dev/null || break
-    done
     iptables -t nat -F "$NAT_CHAIN" 2>/dev/null || true
     iptables -t nat -X "$NAT_CHAIN" 2>/dev/null || true
-    iptables -t nat -F WARP_GOOGLE 2>/dev/null || true
-    iptables -t nat -X WARP_GOOGLE 2>/dev/null || true
 }
 
 prefer_ipv4_for_google() {
@@ -510,6 +524,23 @@ stop_timer() {
     systemctl disable --now "$REFRESH_TIMER" >/dev/null 2>&1 || true
 }
 
+timer_on() {
+    need_root
+    start_timer
+    echo -e "${GREEN}✓ 已启用定时刷新${NC}"
+}
+
+timer_off() {
+    need_root
+    stop_timer
+    echo -e "${GREEN}✓ 已停用定时刷新${NC}"
+}
+
+timer_status() {
+    echo -e "${CYAN}定时器状态: ${NC}"
+    systemctl status "$REFRESH_TIMER" --no-pager --lines=8 2>/dev/null || echo -e "${RED}未找到 ${REFRESH_TIMER}${NC}"
+}
+
 start() {
     need_root
     echo -e "${CYAN}启动 Gemini 域名透明代理...${NC}"
@@ -531,7 +562,6 @@ stop() {
     stop_timer
     remove_iptables
     ipset destroy "$IPSET_NAME" 2>/dev/null || true
-    systemctl stop "$REDSOCKS_SERVICE" >/dev/null 2>&1 || true
     pkill redsocks >/dev/null 2>&1 || true
     remove_ipv4_prefer
     rm -f "$DNSMASQ_CONF"
@@ -614,7 +644,6 @@ uninstall() {
     stop >/dev/null 2>&1 || true
     systemctl disable --now warp-gemini.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/warp-gemini.service
-    rm -f /etc/systemd/system/warp-gemini-redsocks.service
     rm -f /etc/systemd/system/warp-gemini-refresh.service
     rm -f /etc/systemd/system/warp-gemini-refresh.timer
     rm -f /usr/local/bin/warp-gemini-refresh
@@ -633,6 +662,9 @@ case "$1" in
     stop-all) stop_all ;;
     restart) stop; sleep 1; start ;;
     refresh) refresh ;;
+    timer-on) timer_on ;;
+    timer-off) timer_off ;;
+    timer-status) timer_status ;;
     status) status ;;
     test) test_conn ;;
     domains) domains ;;
@@ -647,6 +679,9 @@ case "$1" in
         echo "  stop-all   停止代理并断开 WARP"
         echo "  restart    重启代理"
         echo "  refresh    立即刷新 IP/CIDR/域名目标"
+        echo "  timer-on   启用定时刷新"
+        echo "  timer-off  停用定时刷新"
+        echo "  timer-status 查看定时器状态"
         echo "  status     查看状态"
         echo "  test       测试连接"
         echo "  domains    编辑目标列表（支持 IP/CIDR/域名）"
@@ -674,22 +709,6 @@ ExecStop=${CONTROL_SCRIPT} stop
 [Install]
 WantedBy=multi-user.target
 EOF_SERVICE
-
-    cat > "$REDSOCKS_SERVICE_FILE" <<EOF_REDSOCKS_SERVICE
-[Unit]
-Description=Redsocks for WARP Gemini transparent proxy
-After=network.target warp-svc.service
-Wants=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/sbin/redsocks -c ${REDSOCKS_CONF}
-Restart=on-failure
-RestartSec=2s
-
-[Install]
-WantedBy=multi-user.target
-EOF_REDSOCKS_SERVICE
 
     cat > "$REFRESH_SERVICE" <<EOF_REFRESH_SERVICE
 [Unit]
@@ -732,7 +751,6 @@ setup_all() {
     echo -e "\n${CYAN}[5/6] 启动 Gemini 域名透明代理...${NC}"
     "$CONTROL_SCRIPT" start
     systemctl enable warp-gemini.service >/dev/null 2>&1 || true
-    systemctl enable warp-gemini-redsocks.service >/dev/null 2>&1 || true
 
     echo -e "\n${CYAN}[6/6] 测试...${NC}"
     "$CONTROL_SCRIPT" test || true
@@ -740,8 +758,7 @@ setup_all() {
     echo -e "\n${GREEN}╔════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║        安装完成：仅 Gemini 域名走 WARP             ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
-    echo -e "\n管理命令: ${CYAN}warp-gemini {start|stop|stop-all|restart|refresh|status|test|domains|uninstall}${NC}"
-    echo -e "兼容命令: ${CYAN}warp {start|stop|stop-all|restart|refresh|status|test|domains|uninstall}${NC}\n"
+    echo -e "\n管理命令: ${CYAN}warp-gemini {start|stop|stop-all|restart|refresh|timer-on|timer-off|timer-status|status|test|domains|uninstall}${NC}\n"
 }
 
 do_status() {
@@ -762,7 +779,6 @@ do_stop() {
         iptables -t nat -F "$NAT_CHAIN" 2>/dev/null || true
         iptables -t nat -X "$NAT_CHAIN" 2>/dev/null || true
         ipset destroy "$IPSET_NAME" 2>/dev/null || true
-        systemctl stop warp-gemini-redsocks.service >/dev/null 2>&1 || true
         pkill redsocks >/dev/null 2>&1 || true
     fi
 }
@@ -774,17 +790,23 @@ show_menu() {
     echo -e "  ${GREEN}3.${NC} 查看状态"
     echo -e "  ${GREEN}4.${NC} 立即刷新 Gemini 域名 IP"
     echo -e "  ${GREEN}5.${NC} 编辑 Gemini 域名列表"
-    echo -e "  ${GREEN}6.${NC} 卸载脚本配置"
+    echo -e "  ${GREEN}6.${NC} 启用定时刷新"
+    echo -e "  ${GREEN}7.${NC} 停用定时刷新"
+    echo -e "  ${GREEN}8.${NC} 查看定时器状态"
+    echo -e "  ${GREEN}9.${NC} 卸载脚本配置"
     echo -e "  ${GREEN}0.${NC} 退出\n"
 
-    read -r -p "请输入选项 [0-6]: " choice
+    read -r -p "请输入选项 [0-9]: " choice
     case "$choice" in
         1) setup_all ;;
         2) do_stop ;;
         3) do_status ;;
         4) "$CONTROL_SCRIPT" refresh ;;
         5) "$CONTROL_SCRIPT" domains ;;
-        6) "$CONTROL_SCRIPT" uninstall ;;
+        6) "$CONTROL_SCRIPT" timer-on ;;
+        7) "$CONTROL_SCRIPT" timer-off ;;
+        8) "$CONTROL_SCRIPT" timer-status ;;
+        9) "$CONTROL_SCRIPT" uninstall ;;
         0) echo -e "\n${GREEN}再见！${NC}"; exit 0 ;;
         *) echo -e "\n${RED}无效选项${NC}" ;;
     esac
