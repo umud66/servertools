@@ -23,6 +23,9 @@ TROJAN_CONF="$TROJAN_DIR/server-deploy.conf"
 TROJAN_JSON="$TROJAN_DIR/config.json"
 HYSTERIA_CONF="$HYSTERIA_DIR/server-deploy.conf"
 HYSTERIA_YAML="$HYSTERIA_DIR/config.yaml"
+XRAY_DIR="/etc/xray"
+XRAY_CONF="$XRAY_DIR/server-deploy.conf"
+XRAY_JSON="$XRAY_DIR/config.json"
 PICKED_DOMAIN_FILE=""
 
 show_banner() {
@@ -67,7 +70,7 @@ need_root() {
 }
 
 ensure_dirs() {
-    mkdir -p "$DOMAIN_DIR" "$TROJAN_DIR" "$HYSTERIA_DIR" "$RUNTIME_DIR"
+    mkdir -p "$DOMAIN_DIR" "$TROJAN_DIR" "$HYSTERIA_DIR" "$XRAY_DIR" "$RUNTIME_DIR"
     touch "$LOG_FILE"
 }
 
@@ -980,6 +983,38 @@ install_hysteria2() {
     log_ok "Hysteria2 安装完成"
 }
 
+install_xray() {
+    local version asset_name url temp_dir pkg binary_path
+
+    require_command curl || return 1
+    require_command unzip || return 1
+
+    case "$ARCH" in
+        amd64) asset_name="Xray-linux-64.zip" ;;
+        arm64) asset_name="Xray-linux-arm64-v8a.zip" ;;
+        *) log_error "Xray 不支持当前架构: ${ARCH}"; return 1 ;;
+    esac
+
+    version="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name"' | head -n 1 | cut -d '"' -f4)"
+    [[ -n "$version" ]] || { log_error "无法获取 Xray-core 最新版本"; return 1; }
+
+    url="https://github.com/XTLS/Xray-core/releases/download/${version}/${asset_name}"
+    temp_dir="$(mktemp -d)"
+    pkg="${temp_dir}/xray.zip"
+
+    if ! curl -fL "$url" -o "$pkg" || ! unzip -oq "$pkg" -d "$temp_dir"; then
+        rm -rf "$temp_dir"
+        log_error "Xray-core 下载或解压失败"
+        return 1
+    fi
+
+    binary_path="$(find "$temp_dir" -type f -name xray | head -n 1)"
+    [[ -n "$binary_path" ]] || { rm -rf "$temp_dir"; log_error "压缩包内未找到 xray 二进制"; return 1; }
+    install -m 0755 "$binary_path" /usr/local/bin/xray
+    rm -rf "$temp_dir"
+    log_ok "Xray-core 安装完成: ${version}"
+}
+
 write_trojan_service_unit() {
     cat > "/etc/systemd/system/trojan-go.service" <<EOF
 [Unit]
@@ -1008,6 +1043,24 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=${hysteria_bin} server -c ${HYSTERIA_YAML}
+Restart=always
+RestartSec=3
+LimitNOFILE=51200
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_xray_service_unit() {
+    cat > "/etc/systemd/system/xray.service" <<EOF
+[Unit]
+Description=Xray VLESS Reality
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config ${XRAY_JSON}
 Restart=always
 RestartSec=3
 LimitNOFILE=51200
@@ -1196,6 +1249,154 @@ EOF
     log_ok "Hysteria2 已启动"
 }
 
+configure_vless_reality() {
+    local port server_address reality_dest server_name short_id input_short_id uuid key_output private_key public_key
+    local temp_config server_address_uri vless_link
+
+    [[ -x /usr/local/bin/xray ]] || { log_error "未找到 xray 二进制，请先安装 Xray-core"; return 1; }
+    require_command openssl || return 1
+
+    read -r -p "输入 VLESS Reality TCP 监听端口(默认 443): " port
+    port="${port:-443}"
+    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+        log_error "端口必须是 1 到 65535 的整数"
+        return 1
+    fi
+    check_port_in_use "$port" || return 1
+
+    read -r -p "输入客户端连接地址(默认当前 IPv4): " server_address
+    server_address="${server_address:-$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)}"
+    if [[ -z "$server_address" || "$server_address" =~ [[:space:]\"\\] ]]; then
+        log_error "客户端连接地址不能为空，且不能包含空格、双引号或反斜杠"
+        return 1
+    fi
+
+    read -r -p "输入 Reality 目标地址(默认 www.cloudflare.com:443): " reality_dest
+    reality_dest="${reality_dest:-www.cloudflare.com:443}"
+    if [[ ! "$reality_dest" =~ ^[A-Za-z0-9.-]+:[1-9][0-9]{0,4}$ ]]; then
+        log_error "Reality 目标地址格式应为 域名:端口"
+        return 1
+    fi
+    if (( ${reality_dest##*:} > 65535 )); then
+        log_error "Reality 目标端口必须小于等于 65535"
+        return 1
+    fi
+
+    read -r -p "输入 Reality SNI(默认 www.cloudflare.com): " server_name
+    server_name="${server_name:-www.cloudflare.com}"
+    validate_domain_record "$server_name" || return 1
+
+    short_id="$(openssl rand -hex 8)"
+    read -r -p "输入 Reality Short ID(默认 ${short_id}): " input_short_id
+    short_id="${input_short_id:-$short_id}"
+    if ! [[ "$short_id" =~ ^[0-9a-fA-F]{2,16}$ ]] || (( ${#short_id} % 2 != 0 )); then
+        log_error "Short ID 必须是 2 到 16 位、长度为偶数的十六进制字符串"
+        return 1
+    fi
+
+    uuid="$(/usr/local/bin/xray uuid)"
+    key_output="$(/usr/local/bin/xray x25519)"
+    private_key="$(awk -F': ' '/Private key/ {print $2; exit}' <<< "$key_output")"
+    public_key="$(awk -F': ' '/Public key/ {print $2; exit}' <<< "$key_output")"
+    if [[ -z "$uuid" || -z "$private_key" || -z "$public_key" ]]; then
+        log_error "Xray Reality 密钥生成失败"
+        return 1
+    fi
+
+    temp_config="$(mktemp)"
+    cat > "$temp_config" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": "xtls-rprx-vision"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${reality_dest}",
+          "xver": 0,
+          "serverNames": [
+            "${server_name}"
+          ],
+          "privateKey": "${private_key}",
+          "shortIds": [
+            "${short_id}"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+    if ! /usr/local/bin/xray run -test -config "$temp_config"; then
+        rm -f "$temp_config"
+        log_error "VLESS Reality 配置校验失败，未覆盖现有配置"
+        return 1
+    fi
+    install -m 0600 "$temp_config" "$XRAY_JSON"
+    rm -f "$temp_config"
+
+    write_xray_service_unit
+    systemctl daemon-reload
+    systemctl reset-failed xray.service >/dev/null 2>&1 || true
+    if ! systemctl enable --now xray.service; then
+        log_error "Xray 启动命令失败"
+        journalctl -u xray.service --no-pager -n 50 || true
+        return 1
+    fi
+    if ! verify_service_active xray.service; then
+        journalctl -u xray.service --no-pager -n 50 || true
+        return 1
+    fi
+
+    if [[ "$server_address" == *:* && "$server_address" != \[*\] ]]; then
+        server_address_uri="[${server_address}]"
+    else
+        server_address_uri="$server_address"
+    fi
+    vless_link="vless://${uuid}@${server_address_uri}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${server_name}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#VLESS-Reality"
+    save_kv_file "$XRAY_CONF" \
+        "TYPE=vless-reality" \
+        "PORT=$port" \
+        "SERVER_ADDRESS=$server_address" \
+        "REALITY_DEST=$reality_dest" \
+        "SNI=$server_name" \
+        "UUID=$uuid" \
+        "PUBLIC_KEY=$public_key" \
+        "SHORT_ID=$short_id" \
+        "VLESS_LINK=$vless_link"
+
+    log_ok "VLESS + Reality 已启动"
+    echo "客户端链接:"
+    echo "$vless_link"
+}
+
 show_status() {
     echo "==== 域名 ===="
     list_domains
@@ -1206,8 +1407,11 @@ show_status() {
     echo "==== Hysteria2 配置 ===="
     [[ -f "$HYSTERIA_CONF" ]] && cat "$HYSTERIA_CONF" || echo " - 未配置"
     echo
+    echo "==== VLESS + Reality 配置 ===="
+    [[ -f "$XRAY_CONF" ]] && cat "$XRAY_CONF" || echo " - 未配置"
+    echo
     echo "==== systemd 状态 ===="
-    systemctl --no-pager --type=service | grep -E 'trojan-go.service|hysteria2.service' || true
+    systemctl --no-pager --type=service | grep -E 'trojan-go.service|hysteria2.service|xray.service' || true
     echo
     show_bbr_status
     echo
@@ -1264,7 +1468,8 @@ quick_wizard() {
     echo "选择要安装的服务："
     echo "[1] 仅 Trojan-Go"
     echo "[2] 仅 Hysteria2"
-    echo "[3] 两者都安装"
+    echo "[3] 仅 VLESS + Reality"
+    echo "[4] Trojan-Go、Hysteria2、VLESS + Reality"
     read -r -p "输入编号: " service_choice
 
     case "$service_choice" in
@@ -1279,12 +1484,18 @@ quick_wizard() {
             configure_hysteria_instance || return 1
             ;;
         3)
+            install_xray
+            configure_vless_reality || return 1
+            ;;
+        4)
             echo "Trojan-Go 需要先配置域名和证书。"
             add_domain
             install_trojan_go
             install_hysteria2
+            install_xray
             configure_trojan_instance || return 1
             configure_hysteria_instance || return 1
+            configure_vless_reality || return 1
             ;;
         *)
             log_warn "未选择服务，跳过服务配置"
@@ -1360,6 +1571,26 @@ hysteria_menu() {
     done
 }
 
+xray_menu() {
+    while true; do
+        show_banner
+        echo "VLESS + Reality 管理"
+        echo "[1] 安装 Xray-core"
+        echo "[2] 配置并启用 VLESS + Reality"
+        echo "[3] 查看 Xray 服务日志"
+        echo "[0] 返回主菜单"
+        read -r -p "请选择: " choice
+
+        case "$choice" in
+            1) install_xray; pause_wait ;;
+            2) configure_vless_reality; pause_wait ;;
+            3) journalctl -u xray.service --no-pager -n 80 || true; pause_wait ;;
+            0) return 0 ;;
+            *) log_warn "无效选择"; pause_wait ;;
+        esac
+    done
+}
+
 main_menu() {
     while true; do
         show_banner
@@ -1371,10 +1602,11 @@ main_menu() {
         echo "[5] 域名与证书管理"
         echo "[6] Trojan-Go 管理"
         echo "[7] Hysteria2 管理"
-        echo "[8] 保护检查"
-        echo "[9] 查看当前状态"
-        echo "[10] 测试工具"
-        echo "[11] 快速部署向导"
+        echo "[8] VLESS + Reality 管理"
+        echo "[9] 保护检查"
+        echo "[10] 查看当前状态"
+        echo "[11] 测试工具"
+        echo "[12] 快速部署向导"
         echo "[0] 退出"
         read -r -p "请选择: " choice
 
@@ -1386,10 +1618,11 @@ main_menu() {
             5) domain_menu ;;
             6) trojan_menu ;;
             7) hysteria_menu ;;
-            8) protection_menu ;;
-            9) show_status; pause_wait ;;
-            10) test_tools_menu ;;
-            11) quick_wizard; pause_wait ;;
+            8) xray_menu ;;
+            9) protection_menu ;;
+            10) show_status; pause_wait ;;
+            11) test_tools_menu ;;
+            12) quick_wizard; pause_wait ;;
             0) exit 0 ;;
             *) log_warn "无效选择"; pause_wait ;;
         esac
