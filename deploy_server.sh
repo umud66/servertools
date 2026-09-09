@@ -1296,8 +1296,8 @@ configure_vless_reality() {
 
     uuid="$(/usr/local/bin/xray uuid)"
     key_output="$(/usr/local/bin/xray x25519)"
-    private_key="$(awk -F': ' '/Private key/ {print $2; exit}' <<< "$key_output")"
-    public_key="$(awk -F': ' '/Public key/ {print $2; exit}' <<< "$key_output")"
+    private_key="$(awk -F': *' 'tolower($1) ~ /^private[[:space:]]*key$/ {print $2; exit}' <<< "$key_output")"
+    public_key="$(awk -F': *' 'tolower($1) ~ /^public[[:space:]]*key$/ || tolower($1) ~ /^password/ {print $2; exit}' <<< "$key_output")"
     if [[ -z "$uuid" || -z "$private_key" || -z "$public_key" ]]; then
         log_error "Xray Reality 密钥生成失败"
         return 1
@@ -1391,10 +1391,25 @@ EOF
         "PUBLIC_KEY=$public_key" \
         "SHORT_ID=$short_id" \
         "VLESS_LINK=$vless_link"
+    chmod 0600 "$XRAY_CONF"
 
     log_ok "VLESS + Reality 已启动"
     echo "客户端链接:"
     echo "$vless_link"
+}
+
+show_vless_reality_link() {
+    local vless_link
+    vless_link="$(read_kv "$XRAY_CONF" "VLESS_LINK" || true)"
+    if [[ -z "$vless_link" ]]; then
+        log_error "未找到已保存的 VLESS Reality 链接，请先完成配置并启用服务"
+        return 1
+    fi
+
+    echo "==== VLESS + Reality 客户端链接 ===="
+    echo "$vless_link"
+    echo
+    echo "Worker 导入：配置管理 → 新增配置 → 导入链接 / JSON，粘贴这一整行 vless:// 链接。"
 }
 
 show_status() {
@@ -1578,6 +1593,7 @@ xray_menu() {
         echo "[1] 安装 Xray-core"
         echo "[2] 配置并启用 VLESS + Reality"
         echo "[3] 查看 Xray 服务日志"
+        echo "[4] 导出 VLESS Reality 链接"
         echo "[0] 返回主菜单"
         read -r -p "请选择: " choice
 
@@ -1585,6 +1601,7 @@ xray_menu() {
             1) install_xray; pause_wait ;;
             2) configure_vless_reality; pause_wait ;;
             3) journalctl -u xray.service --no-pager -n 80 || true; pause_wait ;;
+            4) show_vless_reality_link; pause_wait ;;
             0) return 0 ;;
             *) log_warn "无效选择"; pause_wait ;;
         esac
