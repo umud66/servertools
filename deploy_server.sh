@@ -1251,7 +1251,7 @@ EOF
 
 configure_vless_reality() {
     local port access_domain reality_dest server_name short_id input_short_id uuid key_output private_key public_key
-    local temp_config ipv6_bindv6only vless_link
+    local ipv6_bindv6only
 
     [[ -x /usr/local/bin/xray ]] || { log_error "未找到 xray 二进制，请先安装 Xray-core"; return 1; }
     require_command openssl || return 1
@@ -1300,91 +1300,8 @@ configure_vless_reality() {
         return 1
     fi
 
-    temp_config="$(mktemp /tmp/xray-reality.XXXXXX.json)"
-    cat > "$temp_config" <<EOF
-{
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "listen": "::",
-      "port": ${port},
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "${uuid}",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${reality_dest}",
-          "xver": 0,
-          "serverNames": [
-            "${server_name}"
-          ],
-          "privateKey": "${private_key}",
-          "shortIds": [
-            "${short_id}"
-          ]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-
-    if ! /usr/local/bin/xray run -test -config "$temp_config"; then
-        rm -f "$temp_config"
-        log_error "VLESS Reality 配置校验失败，未覆盖现有配置"
-        return 1
-    fi
-    install -m 0600 "$temp_config" "$XRAY_JSON"
-    rm -f "$temp_config"
-
-    write_xray_service_unit
-    systemctl daemon-reload
-    systemctl reset-failed xray.service >/dev/null 2>&1 || true
-    if ! systemctl enable --now xray.service; then
-        log_error "Xray 启动命令失败"
-        journalctl -u xray.service --no-pager -n 50 || true
-        return 1
-    fi
-    if ! verify_service_active xray.service; then
-        journalctl -u xray.service --no-pager -n 50 || true
-        return 1
-    fi
-
-    vless_link="$(build_vless_reality_link "$access_domain" "$port" "$server_name" "$uuid" "$public_key" "$short_id" "chrome")"
-    save_kv_file "$XRAY_CONF" \
-        "TYPE=vless-reality" \
-        "PORT=$port" \
-        "SERVER_DOMAIN=$access_domain" \
-        "REALITY_DEST=$reality_dest" \
-        "SNI=$server_name" \
-        "UUID=$uuid" \
-        "PUBLIC_KEY=$public_key" \
-        "SHORT_ID=$short_id" \
-        "FINGERPRINT=chrome" \
-        "VLESS_LINK=$vless_link"
-    chmod 0600 "$XRAY_CONF"
+    apply_vless_reality_config "$port" "$reality_dest" "$server_name" "$uuid" "$private_key" "$short_id" || return 1
+    save_vless_reality_state "$port" "$access_domain" "$reality_dest" "$server_name" "$uuid" "$private_key" "$public_key" "$short_id" "chrome"
 
     log_ok "VLESS + Reality 已启动"
     ipv6_bindv6only="$(sysctl -n net.ipv6.bindv6only 2>/dev/null || echo 0)"
@@ -1394,6 +1311,153 @@ EOF
     echo "服务监听地址: ::（IPv6；Ubuntu 默认 net.ipv6.bindv6only=0 时同时接受 IPv4）"
     echo "客户端访问域名: ${access_domain}"
     echo "使用“导出 VLESS Reality 链接”可查看已保存的域名链接。"
+}
+
+apply_vless_reality_config() {
+    local port="$1" reality_dest="$2" server_name="$3" uuid="$4" private_key="$5" short_id="$6"
+    local temp_config backup_config had_backup=0
+
+    temp_config="$(mktemp /tmp/xray-reality.XXXXXX.json)"
+    cat > "$temp_config" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "dns": {"queryStrategy": "UseIPv4"},
+  "inbounds": [{
+    "listen": "::",
+    "port": ${port},
+    "protocol": "vless",
+    "settings": {"clients": [{"id": "${uuid}", "flow": "xtls-rprx-vision"}], "decryption": "none"},
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {"show": false, "dest": "${reality_dest}", "xver": 0, "serverNames": ["${server_name}"], "privateKey": "${private_key}", "shortIds": ["${short_id}"]}
+    },
+    "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
+  }],
+  "outbounds": [{"protocol": "freedom", "tag": "direct", "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}}}]
+}
+EOF
+
+    if ! /usr/local/bin/xray run -test -config "$temp_config"; then
+        rm -f "$temp_config"
+        log_error "VLESS Reality 配置校验失败，未覆盖现有配置"
+        return 1
+    fi
+
+    backup_config="$(mktemp /tmp/xray-reality-backup.XXXXXX.json)"
+    if [[ -f "$XRAY_JSON" ]]; then
+        cp "$XRAY_JSON" "$backup_config"
+        had_backup=1
+    fi
+    install -m 0600 "$temp_config" "$XRAY_JSON"
+    rm -f "$temp_config"
+
+    write_xray_service_unit
+    systemctl daemon-reload
+    systemctl reset-failed xray.service >/dev/null 2>&1 || true
+    if ! systemctl enable xray.service >/dev/null 2>&1 || ! systemctl restart xray.service; then
+        if [[ "$had_backup" -eq 1 ]]; then
+            install -m 0600 "$backup_config" "$XRAY_JSON"
+            systemctl restart xray.service >/dev/null 2>&1 || true
+            log_warn "Xray 启动失败，已恢复上一份配置"
+        fi
+        rm -f "$backup_config"
+        log_error "Xray 启动失败"
+        journalctl -u xray.service --no-pager -n 50 || true
+        return 1
+    fi
+    rm -f "$backup_config"
+    verify_service_active xray.service
+}
+
+save_vless_reality_state() {
+    local port="$1" access_domain="$2" reality_dest="$3" server_name="$4" uuid="$5" private_key="$6" public_key="$7" short_id="$8" fingerprint="$9"
+    local vless_link
+
+    vless_link="$(build_vless_reality_link "$access_domain" "$port" "$server_name" "$uuid" "$public_key" "$short_id" "$fingerprint")"
+    save_kv_file "$XRAY_CONF" \
+        "TYPE=vless-reality" \
+        "PORT=$port" \
+        "SERVER_DOMAIN=$access_domain" \
+        "OUTBOUND_DOMAIN_STRATEGY=UseIPv4" \
+        "REALITY_DEST=$reality_dest" \
+        "SNI=$server_name" \
+        "UUID=$uuid" \
+        "PRIVATE_KEY=$private_key" \
+        "PUBLIC_KEY=$public_key" \
+        "SHORT_ID=$short_id" \
+        "FINGERPRINT=$fingerprint" \
+        "VLESS_LINK=$vless_link"
+    chmod 0600 "$XRAY_CONF"
+}
+
+edit_vless_reality() {
+    local port old_port access_domain reality_dest server_name short_id fingerprint
+    local uuid private_key public_key input_value
+
+    [[ -x /usr/local/bin/xray ]] || { log_error "未找到 xray 二进制，请先安装 Xray-core"; return 1; }
+    [[ -f "$XRAY_CONF" ]] || { log_error "未找到已有 VLESS Reality 配置，请先完成首次配置"; return 1; }
+
+    port="$(read_kv "$XRAY_CONF" "PORT" || true)"
+    access_domain="$(read_kv "$XRAY_CONF" "SERVER_DOMAIN" || true)"
+    reality_dest="$(read_kv "$XRAY_CONF" "REALITY_DEST" || true)"
+    server_name="$(read_kv "$XRAY_CONF" "SNI" || true)"
+    uuid="$(read_kv "$XRAY_CONF" "UUID" || true)"
+    private_key="$(read_kv "$XRAY_CONF" "PRIVATE_KEY" || true)"
+    public_key="$(read_kv "$XRAY_CONF" "PUBLIC_KEY" || true)"
+    short_id="$(read_kv "$XRAY_CONF" "SHORT_ID" || true)"
+    fingerprint="$(read_kv "$XRAY_CONF" "FINGERPRINT" || true)"
+    private_key="${private_key:-$(awk -F'"' '/"privateKey"/ {print $4; exit}' "$XRAY_JSON" 2>/dev/null || true)}"
+    fingerprint="${fingerprint:-chrome}"
+    old_port="$port"
+
+    if [[ -z "$port" || -z "$access_domain" || -z "$reality_dest" || -z "$server_name" || -z "$uuid" || -z "$private_key" || -z "$public_key" || -z "$short_id" ]]; then
+        log_error "现有配置不完整，无法安全编辑；请重新执行首次配置"
+        return 1
+    fi
+
+    read -r -p "VLESS Reality TCP 监听端口 [${port}]: " input_value
+    port="${input_value:-$port}"
+    if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
+        log_error "端口必须是 1 到 65535 的整数"
+        return 1
+    fi
+    if [[ "$port" != "$old_port" ]]; then
+        check_port_in_use "$port" || return 1
+    fi
+
+    read -r -p "客户端访问域名 [${access_domain}]: " input_value
+    access_domain="${input_value:-$access_domain}"
+    validate_domain_record "$access_domain" || return 1
+
+    read -r -p "Reality 目标地址 [${reality_dest}]: " input_value
+    reality_dest="${input_value:-$reality_dest}"
+    if [[ ! "$reality_dest" =~ ^[A-Za-z0-9.-]+:[1-9][0-9]{0,4}$ ]] || (( ${reality_dest##*:} > 65535 )); then
+        log_error "Reality 目标地址格式应为 域名:端口，端口最大 65535"
+        return 1
+    fi
+
+    read -r -p "Reality SNI [${server_name}]: " input_value
+    server_name="${input_value:-$server_name}"
+    validate_domain_record "$server_name" || return 1
+
+    read -r -p "Reality Short ID [${short_id}]: " input_value
+    short_id="${input_value:-$short_id}"
+    if ! [[ "$short_id" =~ ^[0-9a-fA-F]{2,16}$ ]] || (( ${#short_id} % 2 != 0 )); then
+        log_error "Short ID 必须是 2 到 16 位、长度为偶数的十六进制字符串"
+        return 1
+    fi
+
+    read -r -p "客户端指纹 [${fingerprint}]: " input_value
+    fingerprint="${input_value:-$fingerprint}"
+    case "$fingerprint" in
+        chrome|firefox|safari|edge) ;;
+        *) log_error "客户端指纹仅支持 chrome、firefox、safari 或 edge"; return 1 ;;
+    esac
+
+    apply_vless_reality_config "$port" "$reality_dest" "$server_name" "$uuid" "$private_key" "$short_id" || return 1
+    save_vless_reality_state "$port" "$access_domain" "$reality_dest" "$server_name" "$uuid" "$private_key" "$public_key" "$short_id" "$fingerprint"
+    log_ok "VLESS + Reality 配置已更新，UUID 与 Reality 密钥保持不变"
 }
 
 build_vless_reality_link() {
@@ -1608,16 +1672,18 @@ xray_menu() {
         echo "VLESS + Reality 管理"
         echo "[1] 安装 Xray-core"
         echo "[2] 配置并启用 VLESS + Reality"
-        echo "[3] 查看 Xray 服务日志"
-        echo "[4] 导出 VLESS Reality 链接"
+        echo "[3] 编辑已有 VLESS + Reality 配置"
+        echo "[4] 查看 Xray 服务日志"
+        echo "[5] 导出 VLESS Reality 链接"
         echo "[0] 返回主菜单"
         read -r -p "请选择: " choice
 
         case "$choice" in
             1) install_xray; pause_wait ;;
             2) configure_vless_reality; pause_wait ;;
-            3) journalctl -u xray.service --no-pager -n 80 || true; pause_wait ;;
-            4) show_vless_reality_link; pause_wait ;;
+            3) edit_vless_reality; pause_wait ;;
+            4) journalctl -u xray.service --no-pager -n 80 || true; pause_wait ;;
+            5) show_vless_reality_link; pause_wait ;;
             0) return 0 ;;
             *) log_warn "无效选择"; pause_wait ;;
         esac
