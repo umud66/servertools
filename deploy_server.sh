@@ -1250,8 +1250,8 @@ EOF
 }
 
 configure_vless_reality() {
-    local port server_address reality_dest server_name short_id input_short_id uuid key_output private_key public_key
-    local temp_config server_address_uri vless_link
+    local port reality_dest server_name short_id input_short_id uuid key_output private_key public_key
+    local temp_config ipv6_bindv6only
 
     [[ -x /usr/local/bin/xray ]] || { log_error "未找到 xray 二进制，请先安装 Xray-core"; return 1; }
     require_command openssl || return 1
@@ -1263,13 +1263,6 @@ configure_vless_reality() {
         return 1
     fi
     check_port_in_use "$port" || return 1
-
-    read -r -p "输入客户端连接地址(默认当前 IPv4): " server_address
-    server_address="${server_address:-$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)}"
-    if [[ -z "$server_address" || "$server_address" =~ [[:space:]\"\\] ]]; then
-        log_error "客户端连接地址不能为空，且不能包含空格、双引号或反斜杠"
-        return 1
-    fi
 
     read -r -p "输入 Reality 目标地址(默认 www.cloudflare.com:443): " reality_dest
     reality_dest="${reality_dest:-www.cloudflare.com:443}"
@@ -1303,7 +1296,7 @@ configure_vless_reality() {
         return 1
     fi
 
-    temp_config="$(mktemp)"
+    temp_config="$(mktemp /tmp/xray-reality.XXXXXX.json)"
     cat > "$temp_config" <<EOF
 {
   "log": {
@@ -1311,7 +1304,7 @@ configure_vless_reality() {
   },
   "inbounds": [
     {
-      "listen": "0.0.0.0",
+      "listen": "::",
       "port": ${port},
       "protocol": "vless",
       "settings": {
@@ -1375,36 +1368,51 @@ EOF
         return 1
     fi
 
-    if [[ "$server_address" == *:* && "$server_address" != \[*\] ]]; then
-        server_address_uri="[${server_address}]"
-    else
-        server_address_uri="$server_address"
-    fi
-    vless_link="vless://${uuid}@${server_address_uri}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${server_name}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#VLESS-Reality"
     save_kv_file "$XRAY_CONF" \
         "TYPE=vless-reality" \
         "PORT=$port" \
-        "SERVER_ADDRESS=$server_address" \
         "REALITY_DEST=$reality_dest" \
         "SNI=$server_name" \
         "UUID=$uuid" \
         "PUBLIC_KEY=$public_key" \
         "SHORT_ID=$short_id" \
-        "VLESS_LINK=$vless_link"
+        "FINGERPRINT=chrome"
     chmod 0600 "$XRAY_CONF"
 
     log_ok "VLESS + Reality 已启动"
-    echo "客户端链接:"
-    echo "$vless_link"
+    ipv6_bindv6only="$(sysctl -n net.ipv6.bindv6only 2>/dev/null || echo 0)"
+    if [[ "$ipv6_bindv6only" == "1" ]]; then
+        log_warn "当前 net.ipv6.bindv6only=1，监听 :: 时仅接受 IPv6；如需 IPv4 请改为 0 或单独添加 IPv4 入站"
+    fi
+    echo "服务监听地址: ::（IPv6；大多数 Ubuntu 默认也同时接受 IPv4）"
+    echo "使用“导出 VLESS Reality 链接”时再填写客户端连接地址。"
 }
 
 show_vless_reality_link() {
-    local vless_link
-    vless_link="$(read_kv "$XRAY_CONF" "VLESS_LINK" || true)"
-    if [[ -z "$vless_link" ]]; then
-        log_error "未找到已保存的 VLESS Reality 链接，请先完成配置并启用服务"
+    local port server_address sni uuid public_key short_id fingerprint server_address_uri vless_link
+    port="$(read_kv "$XRAY_CONF" "PORT" || true)"
+    sni="$(read_kv "$XRAY_CONF" "SNI" || true)"
+    uuid="$(read_kv "$XRAY_CONF" "UUID" || true)"
+    public_key="$(read_kv "$XRAY_CONF" "PUBLIC_KEY" || true)"
+    short_id="$(read_kv "$XRAY_CONF" "SHORT_ID" || true)"
+    fingerprint="$(read_kv "$XRAY_CONF" "FINGERPRINT" || true)"
+    if [[ -z "$port" || -z "$sni" || -z "$uuid" || -z "$public_key" || -z "$short_id" ]]; then
+        log_error "未找到完整 VLESS Reality 配置，请先完成配置并启用服务"
         return 1
     fi
+
+    read -r -p "输入客户端连接地址(默认当前 IPv4，可输入 IPv6): " server_address
+    server_address="${server_address:-$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)}"
+    if [[ -z "$server_address" || "$server_address" =~ [[:space:]\"\\] ]]; then
+        log_error "客户端连接地址不能为空，且不能包含空格、双引号或反斜杠"
+        return 1
+    fi
+    if [[ "$server_address" == *:* && "$server_address" != \[*\] ]]; then
+        server_address_uri="[${server_address}]"
+    else
+        server_address_uri="$server_address"
+    fi
+    vless_link="vless://${uuid}@${server_address_uri}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=${fingerprint:-chrome}&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#VLESS-Reality"
 
     echo "==== VLESS + Reality 客户端链接 ===="
     echo "$vless_link"
