@@ -1300,8 +1300,8 @@ configure_vless_reality() {
         return 1
     fi
 
-    apply_vless_reality_config "$port" "$reality_dest" "$server_name" "$uuid" "$private_key" "$short_id" || return 1
-    save_vless_reality_state "$port" "$access_domain" "$reality_dest" "$server_name" "$uuid" "$private_key" "$public_key" "$short_id" "chrome"
+    apply_vless_reality_config "::" "$port" "$reality_dest" "$server_name" "$uuid" "$private_key" "$short_id" "UseIPv4" || return 1
+    save_vless_reality_state "::" "$port" "$access_domain" "$reality_dest" "$server_name" "$uuid" "$private_key" "$public_key" "$short_id" "chrome" "UseIPv4"
 
     log_ok "VLESS + Reality 已启动"
     ipv6_bindv6only="$(sysctl -n net.ipv6.bindv6only 2>/dev/null || echo 0)"
@@ -1314,7 +1314,7 @@ configure_vless_reality() {
 }
 
 apply_vless_reality_config() {
-    local port="$1" reality_dest="$2" server_name="$3" uuid="$4" private_key="$5" short_id="$6"
+    local listen_address="$1" port="$2" reality_dest="$3" server_name="$4" uuid="$5" private_key="$6" short_id="$7" outbound_strategy="$8"
     local temp_config backup_config had_backup=0
 
     temp_config="$(mktemp /tmp/xray-reality.XXXXXX.json)"
@@ -1323,7 +1323,7 @@ apply_vless_reality_config() {
   "log": {"loglevel": "warning"},
   "dns": {"queryStrategy": "UseIPv4"},
   "inbounds": [{
-    "listen": "::",
+    "listen": "${listen_address}",
     "port": ${port},
     "protocol": "vless",
     "settings": {"clients": [{"id": "${uuid}", "flow": "xtls-rprx-vision"}], "decryption": "none"},
@@ -1334,7 +1334,7 @@ apply_vless_reality_config() {
     },
     "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
   }],
-  "outbounds": [{"protocol": "freedom", "tag": "direct", "streamSettings": {"sockopt": {"domainStrategy": "UseIPv4"}}}]
+  "outbounds": [{"protocol": "freedom", "tag": "direct", "streamSettings": {"sockopt": {"domainStrategy": "${outbound_strategy}"}}}]
 }
 EOF
 
@@ -1371,15 +1371,16 @@ EOF
 }
 
 save_vless_reality_state() {
-    local port="$1" access_domain="$2" reality_dest="$3" server_name="$4" uuid="$5" private_key="$6" public_key="$7" short_id="$8" fingerprint="$9"
+    local listen_address="$1" port="$2" access_domain="$3" reality_dest="$4" server_name="$5" uuid="$6" private_key="$7" public_key="$8" short_id="$9" fingerprint="${10}" outbound_strategy="${11}"
     local vless_link
 
     vless_link="$(build_vless_reality_link "$access_domain" "$port" "$server_name" "$uuid" "$public_key" "$short_id" "$fingerprint")"
     save_kv_file "$XRAY_CONF" \
         "TYPE=vless-reality" \
+        "LISTEN_ADDRESS=$listen_address" \
         "PORT=$port" \
         "SERVER_DOMAIN=$access_domain" \
-        "OUTBOUND_DOMAIN_STRATEGY=UseIPv4" \
+        "OUTBOUND_DOMAIN_STRATEGY=$outbound_strategy" \
         "REALITY_DEST=$reality_dest" \
         "SNI=$server_name" \
         "UUID=$uuid" \
@@ -1391,28 +1392,50 @@ save_vless_reality_state() {
     chmod 0600 "$XRAY_CONF"
 }
 
+read_xray_json_string() {
+    local key="$1"
+    sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$XRAY_JSON" | head -n 1
+}
+
+read_xray_json_number() {
+    local key="$1"
+    sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$XRAY_JSON" | head -n 1
+}
+
 edit_vless_reality() {
-    local port old_port access_domain reality_dest server_name short_id fingerprint
-    local uuid private_key public_key input_value
+    local listen_address port old_port access_domain reality_dest server_name short_id fingerprint outbound_strategy
+    local uuid private_key public_key key_output input_value
 
     [[ -x /usr/local/bin/xray ]] || { log_error "未找到 xray 二进制，请先安装 Xray-core"; return 1; }
-    [[ -f "$XRAY_CONF" ]] || { log_error "未找到已有 VLESS Reality 配置，请先完成首次配置"; return 1; }
+    [[ -f "$XRAY_JSON" ]] || { log_error "未找到 ${XRAY_JSON}，请先完成首次配置"; return 1; }
 
-    port="$(read_kv "$XRAY_CONF" "PORT" || true)"
+    listen_address="$(read_xray_json_string "listen" || true)"
+    port="$(read_xray_json_number "port" || true)"
     access_domain="$(read_kv "$XRAY_CONF" "SERVER_DOMAIN" || true)"
-    reality_dest="$(read_kv "$XRAY_CONF" "REALITY_DEST" || true)"
-    server_name="$(read_kv "$XRAY_CONF" "SNI" || true)"
-    uuid="$(read_kv "$XRAY_CONF" "UUID" || true)"
-    private_key="$(read_kv "$XRAY_CONF" "PRIVATE_KEY" || true)"
-    public_key="$(read_kv "$XRAY_CONF" "PUBLIC_KEY" || true)"
-    short_id="$(read_kv "$XRAY_CONF" "SHORT_ID" || true)"
+    reality_dest="$(read_xray_json_string "dest" || true)"
+    server_name="$(sed -nE 's/.*"serverNames"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' "$XRAY_JSON" | head -n 1)"
+    uuid="$(read_xray_json_string "id" || true)"
+    private_key="$(read_xray_json_string "privateKey" || true)"
+    short_id="$(sed -nE 's/.*"shortIds"[[:space:]]*:[[:space:]]*\[[[:space:]]*"([^"]*)".*/\1/p' "$XRAY_JSON" | head -n 1)"
+    outbound_strategy="$(read_xray_json_string "domainStrategy" || true)"
     fingerprint="$(read_kv "$XRAY_CONF" "FINGERPRINT" || true)"
-    private_key="${private_key:-$(awk -F'"' '/"privateKey"/ {print $4; exit}' "$XRAY_JSON" 2>/dev/null || true)}"
     fingerprint="${fingerprint:-chrome}"
+    outbound_strategy="${outbound_strategy:-UseIPv4}"
     old_port="$port"
 
-    if [[ -z "$port" || -z "$access_domain" || -z "$reality_dest" || -z "$server_name" || -z "$uuid" || -z "$private_key" || -z "$public_key" || -z "$short_id" ]]; then
+    key_output="$(/usr/local/bin/xray x25519 -i "$private_key" 2>/dev/null || true)"
+    public_key="$(awk -F': *' 'tolower($1) ~ /^public[[:space:]]*key$/ || tolower($1) ~ /^password/ {print $2; exit}' <<< "$key_output")"
+    public_key="${public_key:-$(read_kv "$XRAY_CONF" "PUBLIC_KEY" || true)}"
+
+    if [[ -z "$listen_address" || -z "$port" || -z "$access_domain" || -z "$reality_dest" || -z "$server_name" || -z "$uuid" || -z "$private_key" || -z "$public_key" || -z "$short_id" ]]; then
         log_error "现有配置不完整，无法安全编辑；请重新执行首次配置"
+        return 1
+    fi
+
+    read -r -p "监听地址 [${listen_address}]: " input_value
+    listen_address="${input_value:-$listen_address}"
+    if [[ "$listen_address" =~ [[:space:]\"\\] ]]; then
+        log_error "监听地址不能包含空格、双引号或反斜杠"
         return 1
     fi
 
@@ -1441,6 +1464,13 @@ edit_vless_reality() {
     server_name="${input_value:-$server_name}"
     validate_domain_record "$server_name" || return 1
 
+    read -r -p "用户 UUID [${uuid}]: " input_value
+    uuid="${input_value:-$uuid}"
+    if ! [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
+        log_error "UUID 格式不合法"
+        return 1
+    fi
+
     read -r -p "Reality Short ID [${short_id}]: " input_value
     short_id="${input_value:-$short_id}"
     if ! [[ "$short_id" =~ ^[0-9a-fA-F]{2,16}$ ]] || (( ${#short_id} % 2 != 0 )); then
@@ -1455,8 +1485,15 @@ edit_vless_reality() {
         *) log_error "客户端指纹仅支持 chrome、firefox、safari 或 edge"; return 1 ;;
     esac
 
-    apply_vless_reality_config "$port" "$reality_dest" "$server_name" "$uuid" "$private_key" "$short_id" || return 1
-    save_vless_reality_state "$port" "$access_domain" "$reality_dest" "$server_name" "$uuid" "$private_key" "$public_key" "$short_id" "$fingerprint"
+    read -r -p "服务器出站 IP 协议 [ipv4/ipv6，当前 ${outbound_strategy}]: " input_value
+    case "${input_value:-$outbound_strategy}" in
+        ipv4|IPv4|useipv4|UseIPv4) outbound_strategy="UseIPv4" ;;
+        ipv6|IPv6|useipv6|UseIPv6) outbound_strategy="UseIPv6" ;;
+        *) log_error "出站 IP 协议仅支持 ipv4 或 ipv6"; return 1 ;;
+    esac
+
+    apply_vless_reality_config "$listen_address" "$port" "$reality_dest" "$server_name" "$uuid" "$private_key" "$short_id" "$outbound_strategy" || return 1
+    save_vless_reality_state "$listen_address" "$port" "$access_domain" "$reality_dest" "$server_name" "$uuid" "$private_key" "$public_key" "$short_id" "$fingerprint" "$outbound_strategy"
     log_ok "VLESS + Reality 配置已更新，UUID 与 Reality 密钥保持不变"
 }
 
