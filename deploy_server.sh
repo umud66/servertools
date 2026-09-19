@@ -27,6 +27,9 @@ XRAY_DIR="/etc/xray"
 XRAY_CONF="$XRAY_DIR/server-deploy.conf"
 XRAY_JSON="$XRAY_DIR/config.json"
 PICKED_DOMAIN_FILE=""
+TEST_BIND_IP=""
+TEST_IP_FAMILY=""
+declare -a TEST_CURL_BIND_ARGS=()
 
 show_banner() {
     clear
@@ -104,14 +107,89 @@ require_command() {
     fi
 }
 
-# 执行 HTTP 探测，输出状态码、耗时和结果判断
+# 根据用户选择的本机源 IP 生成 curl 绑定参数。
+refresh_test_curl_bind_args() {
+    TEST_CURL_BIND_ARGS=()
+
+    if [[ -n "$TEST_IP_FAMILY" ]]; then
+        TEST_CURL_BIND_ARGS+=("-$TEST_IP_FAMILY")
+    fi
+
+    if [[ -n "$TEST_BIND_IP" ]]; then
+        TEST_CURL_BIND_ARGS+=(--interface "$TEST_BIND_IP")
+    fi
+}
+
+# 列出可作为出站源地址的公网 IPv4/IPv6。
+list_test_source_ips() {
+    require_command ip || return 1
+
+    ip -o -4 addr show scope global 2>/dev/null | awk '{split($4, parts, "/"); print parts[1]}' | \
+        awk '!/^10\./ && !/^127\./ && !/^169\.254\./ && !/^192\.168\./ && !/^172\.(1[6-9]|2[0-9]|3[01])\./ {print "IPv4\t" $0}'
+    ip -o -6 addr show scope global 2>/dev/null | awk '{split($4, parts, "/"); print "IPv6\t" parts[1]}'
+}
+
+# 选择单个源 IP；curl 使用该地址发起所有本轮请求。
+select_test_source_ip() {
+    local choice family address selected_index
+    local -a source_ips=()
+
+    require_command ip || return 1
+    mapfile -t source_ips < <(list_test_source_ips)
+    if [[ "${#source_ips[@]}" -eq 0 ]]; then
+        log_error "未找到可用于测试的全局 IP 地址"
+        return 1
+    fi
+
+    echo "请选择本轮测试使用的源 IP："
+    echo "[0] 系统默认路由"
+    for selected_index in "${!source_ips[@]}"; do
+        IFS=$'\t' read -r family address <<< "${source_ips[$selected_index]}"
+        printf "[%d] %s %s\n" "$((selected_index + 1))" "$family" "$address"
+    done
+    read -r -p "输入编号（默认 0）: " choice
+    choice="${choice:-0}"
+
+    if [[ "$choice" == "0" ]]; then
+        TEST_BIND_IP=""
+        TEST_IP_FAMILY=""
+        refresh_test_curl_bind_args
+        log_info "本轮测试使用系统默认路由"
+        return 0
+    fi
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#source_ips[@]} )); then
+        log_error "无效 IP 编号"
+        return 1
+    fi
+
+    IFS=$'\t' read -r family address <<< "${source_ips[$((choice - 1))]}"
+    TEST_BIND_IP="$address"
+    if [[ "$family" == "IPv4" ]]; then
+        TEST_IP_FAMILY="4"
+    else
+        TEST_IP_FAMILY="6"
+    fi
+    refresh_test_curl_bind_args
+    log_ok "本轮测试已绑定 ${family} 源地址: ${TEST_BIND_IP}"
+}
+
+show_test_source() {
+    if [[ -n "$TEST_BIND_IP" ]]; then
+        echo "测试源地址: ${TEST_BIND_IP} (IPv${TEST_IP_FAMILY})"
+    else
+        echo "测试源地址: 系统默认路由"
+    fi
+}
+
+# 执行 HTTP 探测，输出状态码、耗时和结果判断。
 http_probe() {
     local name="$1"
     local url="$2"
     local body_file probe_result status time_total final_url result
     body_file="$(mktemp)"
 
-    probe_result="$(curl -L -sS --max-time 20 --connect-timeout 8 -A "Mozilla/5.0" \
+    probe_result="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 -A "Mozilla/5.0" \
         -o "$body_file" -w "%{http_code}|%{time_total}|%{url_effective}" "$url" 2>/dev/null || echo "000|0|$url")"
     status="$(echo "$probe_result" | cut -d'|' -f1)"
     time_total="$(echo "$probe_result" | cut -d'|' -f2)"
@@ -133,35 +211,73 @@ http_probe() {
 }
 
 show_public_ip_info() {
+    local public_ip
+
     require_command curl || return 1
+    refresh_test_curl_bind_args
+    public_ip="$(curl "${TEST_CURL_BIND_ARGS[@]}" -fsS --max-time 10 https://api64.ipify.org 2>/dev/null || true)"
 
     echo "==== 公网 IP 信息 ===="
-    echo "IPv4: $(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || echo 未获取)"
-    echo "IPv6: $(curl -6 -fsS --max-time 10 https://api64.ipify.org 2>/dev/null || echo 未获取)"
+    show_test_source
+    echo "实际出口: ${public_ip:-未获取}"
     echo
     echo "==== Geo 信息 ===="
-    curl -fsS --max-time 15 https://ipinfo.io/json 2>/dev/null || log_warn "ipinfo.io 查询失败"
+    if [[ -n "$public_ip" ]]; then
+        curl "${TEST_CURL_BIND_ARGS[@]}" -fsS --max-time 15 "https://api.ip.sb/geoip/${public_ip}" 2>/dev/null || log_warn "Geo 信息查询失败"
+    else
+        log_warn "未获取出口 IP，跳过 Geo 查询"
+    fi
     echo
+}
+
+# 根据 YouTube Music 页面中的区域及受限提示判断，不依赖账号登录。
+test_youtube_music_unlock() {
+    local body_file probe_result status time_total region result
+    body_file="$(mktemp)"
+    probe_result="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 \
+        -H "Accept-Language: en-US,en;q=0.9" -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36" \
+        -o "$body_file" -w "%{http_code}|%{time_total}" "https://music.youtube.com/" 2>/dev/null || echo "000|0")"
+    status="$(echo "$probe_result" | cut -d'|' -f1)"
+    time_total="$(echo "$probe_result" | cut -d'|' -f2)"
+    region="$(grep -oE '"INNERTUBE_CONTEXT_GL":"[A-Z]{2}"' "$body_file" | head -n 1 | cut -d'"' -f4 || true)"
+
+    if [[ "$status" == "000" || -z "$status" ]]; then
+        result="连接失败"
+    elif grep -Eqi 'www\.google\.cn|not available in your country|not available in your region' "$body_file"; then
+        result="不可用"
+    elif grep -Eqi 'ytmusic|INNERTUBE_API_KEY|INNERTUBE_CONTEXT_GL' "$body_file"; then
+        result="可访问${region:+（地区: $region）}"
+    else
+        result="页面可达，需复核"
+    fi
+
+    printf "%-22s %-8s %-24s %ss\n" "YouTube Music" "$status" "$result" "$time_total"
+    rm -f "$body_file"
 }
 
 test_streaming_unlock() {
     require_command curl || return 1
+    refresh_test_curl_bind_args
 
-    echo "==== 流媒体解锁初筛 ===="
-    echo "说明: 结果用于快速判断，部分平台需要结合网页内容和账号状态复核。"
-    printf "%-18s %-8s %-10s %s\n" "服务" "状态码" "结果" "耗时"
-    http_probe "Netflix" "https://www.netflix.com/title/81215567"
-    http_probe "Disney+" "https://www.disneyplus.com/"
-    http_probe "YouTube" "https://www.youtube.com/premium"
-    http_probe "TikTok" "https://www.tiktok.com/"
-    http_probe "PrimeVideo" "https://www.primevideo.com/"
-    http_probe "Hulu" "https://www.hulu.com/"
+    echo "==== 主流流媒体解锁测试 ===="
+    show_test_source
+    echo "说明: YouTube Music 通过页面区域/受限标记判断；其余为连通性初筛，账号内容仍需实际播放复核。"
+    printf "%-22s %-8s %-24s %s\n" "服务" "状态码" "结果" "耗时"
+    test_youtube_music_unlock
+    http_probe "YouTube Premium" "https://www.youtube.com/premium"
+    http_probe "Netflix（初筛）" "https://www.netflix.com/title/81215567"
+    http_probe "Disney+（初筛）" "https://www.disneyplus.com/"
+    http_probe "Prime Video（初筛）" "https://www.primevideo.com/"
+    http_probe "Spotify（初筛）" "https://www.spotify.com/"
+    http_probe "TikTok（初筛）" "https://www.tiktok.com/"
 }
 
 test_ai_unlock() {
     require_command curl || return 1
+    refresh_test_curl_bind_args
 
     echo "==== AI 服务可访问性测试 ===="
+    show_test_source
     echo "说明: 401 通常代表 API 可达但需要认证，403/451 多数代表限制或拒绝。"
     printf "%-18s %-8s %-10s %s\n" "服务" "状态码" "结果" "耗时"
     http_probe "OpenAI API" "https://api.openai.com/v1/models"
@@ -1574,18 +1690,18 @@ test_tools_menu() {
     while true; do
         show_banner
         echo "测试工具"
-        echo "[1] 公网 IP 与 Geo 信息"
-        echo "[2] 流媒体解锁初筛"
-        echo "[3] AI 服务可访问性测试"
-        echo "[4] 执行全部测试"
+        echo "[1] 选择源 IP 并查看出口与 Geo"
+        echo "[2] 选择源 IP 并测试主流流媒体"
+        echo "[3] 选择源 IP 并测试 AI 服务"
+        echo "[4] 选择源 IP 并执行全部测试"
         echo "[0] 返回主菜单"
         read -r -p "请选择: " choice
 
         case "$choice" in
-            1) show_public_ip_info; pause_wait ;;
-            2) test_streaming_unlock; pause_wait ;;
-            3) test_ai_unlock; pause_wait ;;
-            4) run_all_ip_tests; pause_wait ;;
+            1) select_test_source_ip && show_public_ip_info; pause_wait ;;
+            2) select_test_source_ip && test_streaming_unlock; pause_wait ;;
+            3) select_test_source_ip && test_ai_unlock; pause_wait ;;
+            4) select_test_source_ip && run_all_ip_tests; pause_wait ;;
             0) return 0 ;;
             *) log_warn "无效选择"; pause_wait ;;
         esac

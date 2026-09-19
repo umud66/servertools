@@ -8,7 +8,8 @@
 - Ubuntu 软件源测速与自动切换
 - Ubuntu 场景下启用 BBR 加速
 - 预检查、运行日志、启动后校验
-- IP、流媒体、AI 服务解锁初筛
+- 可选择本机 IPv4/IPv6 源地址的 IP、流媒体、AI 服务解锁初筛
+- 主流流媒体测试优先检测 YouTube Music 的地区可访问性，并覆盖 Netflix、Disney+、Prime Video、Spotify、TikTok
 - 域名管理
   - 支持覆盖已有域名配置
   - 支持按编号或按域名删除
@@ -66,7 +67,8 @@ open subscription_tool.html
 - 运行日志保存在 `/etc/server-deploy-tool/runtime/deploy.log`
 - 优化 Ubuntu 软件源时会备份 `/etc/apt/sources.list` 或 `/etc/apt/sources.list.d/ubuntu.sources`
 - Hysteria2 默认监听 UDP 443
-- 测试工具使用当前服务器出口 IP 发起请求，不会通过已配置的代理链路测试客户端连接
+- 测试工具会列出本机全局 IPv4/IPv6，选择后通过 `curl --interface <IP>` 绑定该源地址发起请求；不会通过已配置的代理链路测试客户端连接
+- YouTube Music 通过页面的地区和受限标记判断；其他平台为连通性初筛，最终仍建议结合账号和客户端实测确认
 - 使用 Let's Encrypt standalone 签发时，如果 `80` 端口被占用，脚本会询问是否释放端口
 
 ## 注意事项
