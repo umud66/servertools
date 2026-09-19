@@ -230,28 +230,138 @@ show_public_ip_info() {
     echo
 }
 
-# 根据 YouTube Music 页面中的区域及受限提示判断，不依赖账号登录。
+# 输出服务返回的解锁结论，不以 HTTP 状态码作为判定依据。
+print_unlock_result() {
+    local service="$1"
+    local result="$2"
+    local detail="$3"
+    local time_total="$4"
+
+    printf "%-22s %-14s %-28s %ss\n" "$service" "$result" "$detail" "$time_total"
+}
+
+# 提取 YouTube 页面返回的地区代码，兼容字段两侧存在空格的响应。
+youtube_region_from_file() {
+    local body_file="$1"
+
+    grep -oE '"INNERTUBE_CONTEXT_GL"[[:space:]]*:[[:space:]]*"[A-Z]{2}"' "$body_file" | \
+        head -n 1 | sed -E 's/.*"([A-Z]{2})"$/\1/' || true
+}
+
+# 根据 YouTube Music 的地区字段及官方受限提示判断，不依赖 HTTP 200。
 test_youtube_music_unlock() {
-    local body_file probe_result status time_total region result
+    local body_file time_total region
     body_file="$(mktemp)"
-    probe_result="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 \
-        -H "Accept-Language: en-US,en;q=0.9" -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36" \
-        -o "$body_file" -w "%{http_code}|%{time_total}" "https://music.youtube.com/" 2>/dev/null || echo "000|0")"
-    status="$(echo "$probe_result" | cut -d'|' -f1)"
-    time_total="$(echo "$probe_result" | cut -d'|' -f2)"
-    region="$(grep -oE '"INNERTUBE_CONTEXT_GL":"[A-Z]{2}"' "$body_file" | head -n 1 | cut -d'"' -f4 || true)"
+    time_total="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 \
+        -H "Accept-Language: en-US,en;q=0.9" \
+        -H "Cookie: CONSENT=YES+cb.20210328-17-p0.en+FX+667; PREF=f7=4000" \
+        -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36" \
+        -o "$body_file" -w "%{time_total}" "https://music.youtube.com/" 2>/dev/null || echo "0")"
+    region="$(youtube_region_from_file "$body_file")"
 
-    if [[ "$status" == "000" || -z "$status" ]]; then
-        result="连接失败"
+    if [[ ! -s "$body_file" ]]; then
+        print_unlock_result "YouTube Music" "检测失败" "网络连接失败" "$time_total"
     elif grep -Eqi 'www\.google\.cn|not available in your country|not available in your region' "$body_file"; then
-        result="不可用"
-    elif grep -Eqi 'ytmusic|INNERTUBE_API_KEY|INNERTUBE_CONTEXT_GL' "$body_file"; then
-        result="可访问${region:+（地区: $region）}"
+        print_unlock_result "YouTube Music" "未解锁" "地区: ${region:-CN/未知}" "$time_total"
+    elif [[ -n "$region" ]]; then
+        print_unlock_result "YouTube Music" "已解锁" "地区: $region" "$time_total"
     else
-        result="页面可达，需复核"
+        print_unlock_result "YouTube Music" "检测失败" "未获取 YouTube 地区字段" "$time_total"
     fi
+    rm -f "$body_file"
+}
 
-    printf "%-22s %-8s %-24s %ss\n" "YouTube Music" "$status" "$result" "$time_total"
+# 根据 Premium 页面的地区字段、可用文案和明确限制文案判断。
+test_youtube_premium_unlock() {
+    local body_file time_total region
+    body_file="$(mktemp)"
+    time_total="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 \
+        -H "Accept-Language: en-US,en;q=0.9" \
+        -H "Cookie: CONSENT=YES+cb.20210328-17-p0.en+FX+667; PREF=f7=4000" \
+        -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36" \
+        -o "$body_file" -w "%{time_total}" "https://www.youtube.com/premium" 2>/dev/null || echo "0")"
+    region="$(youtube_region_from_file "$body_file")"
+
+    if [[ ! -s "$body_file" ]]; then
+        print_unlock_result "YouTube Premium" "检测失败" "网络连接失败" "$time_total"
+    elif grep -Eqi 'www\.google\.cn|Premium is not available in your country' "$body_file"; then
+        print_unlock_result "YouTube Premium" "未解锁" "地区: ${region:-CN/未知}" "$time_total"
+    elif [[ -n "$region" ]] && grep -Eqi 'ad-free|YouTube Premium' "$body_file"; then
+        print_unlock_result "YouTube Premium" "已解锁" "地区: $region" "$time_total"
+    else
+        print_unlock_result "YouTube Premium" "检测失败" "未获取有效地区/可用标记" "$time_total"
+    fi
+    rm -f "$body_file"
+}
+
+# 通过两部 Netflix 标题页的区域受限文案判断完整目录或 Originals Only。
+test_netflix_unlock() {
+    local title_one title_two time_one time_two region
+    title_one="$(mktemp)"
+    title_two="$(mktemp)"
+    time_one="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 \
+        -H "Accept-Language: en-US,en;q=0.9" -A "Mozilla/5.0" -o "$title_one" -w "%{time_total}" \
+        "https://www.netflix.com/title/81280792" 2>/dev/null || echo "0")"
+    time_two="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 \
+        -H "Accept-Language: en-US,en;q=0.9" -A "Mozilla/5.0" -o "$title_two" -w "%{time_total}" \
+        "https://www.netflix.com/title/70143836" 2>/dev/null || echo "0")"
+    region="$(grep -oE '"id":"[A-Z]{2}"[^}]*"countryName"' "$title_one" "$title_two" 2>/dev/null | head -n 1 | sed -E 's/.*"id":"([A-Z]{2})".*/\1/' || true)"
+
+    if [[ ! -s "$title_one" || ! -s "$title_two" ]]; then
+        print_unlock_result "Netflix" "检测失败" "无法获取标题页" "$time_one/$time_two"
+    elif grep -Eqi 'Oh no!|not available in your region|not available in your country' "$title_one" && \
+         grep -Eqi 'Oh no!|not available in your region|not available in your country' "$title_two"; then
+        print_unlock_result "Netflix" "仅自制内容" "地区: ${region:-未知}" "$time_one/$time_two"
+    elif [[ -n "$region" ]]; then
+        print_unlock_result "Netflix" "已解锁" "地区: $region" "$time_one/$time_two"
+    else
+        print_unlock_result "Netflix" "检测失败" "未获取 Netflix 地区标记" "$time_one/$time_two"
+    fi
+    rm -f "$title_one" "$title_two"
+}
+
+# 调用 Spotify 注册预检接口，解析其国家和服务开放字段。
+test_spotify_unlock() {
+    local body_file time_total status_code region launched
+    body_file="$(mktemp)"
+    time_total="$(curl "${TEST_CURL_BIND_ARGS[@]}" -sS --max-time 20 --connect-timeout 8 \
+        -X POST "https://spclient.wg.spotify.com/signup/public/v1/account" \
+        -H "Accept-Language: en" -A "Mozilla/5.0" \
+        --data "birth_day=11&birth_month=11&birth_year=2000&collect_personal_info=undefined&creation_flow=&creation_point=https%3A%2F%2Fwww.spotify.com%2F&displayname=region-check&gender=male&iagree=1&key=a1e486e2729f46d6bb368d6b2bcda326&platform=www&referrer=&send-email=0&thirdpartyemail=0&identifier_token=AgE6YTvEzkReHNfJpO114514" \
+        -o "$body_file" -w "%{time_total}" 2>/dev/null || echo "0")"
+    status_code="$(grep -oE '"status"[[:space:]]*:[[:space:]]*[0-9]+' "$body_file" | head -n 1 | grep -oE '[0-9]+$' || true)"
+    region="$(grep -oE '"country"[[:space:]]*:[[:space:]]*"[A-Z]{2}"' "$body_file" | head -n 1 | sed -E 's/.*"([A-Z]{2})"$/\1/' || true)"
+    launched="$(grep -oE '"is_country_launched"[[:space:]]*:[[:space:]]*(true|false)' "$body_file" | head -n 1 | sed -E 's/.*(true|false)$/\1/' || true)"
+
+    if [[ ! -s "$body_file" ]]; then
+        print_unlock_result "Spotify 注册" "检测失败" "网络连接失败" "$time_total"
+    elif [[ "$status_code" == "120" || "$status_code" == "320" || "$launched" == "false" ]]; then
+        print_unlock_result "Spotify 注册" "未解锁" "地区: ${region:-未知}" "$time_total"
+    elif [[ "$status_code" == "311" && "$launched" == "true" && -n "$region" ]]; then
+        print_unlock_result "Spotify 注册" "已解锁" "地区: $region" "$time_total"
+    else
+        print_unlock_result "Spotify 注册" "检测失败" "未获取 Spotify 解锁字段" "$time_total"
+    fi
+    rm -f "$body_file"
+}
+
+# BBC iPlayer 返回 geolocation 或 UK HLS 标记，可直接判断区域限制。
+test_bbc_iplayer_unlock() {
+    local body_file time_total
+    body_file="$(mktemp)"
+    time_total="$(curl "${TEST_CURL_BIND_ARGS[@]}" -L -sS --max-time 20 --connect-timeout 8 \
+        -A "Mozilla/5.0" -o "$body_file" -w "%{time_total}" \
+        "https://open.live.bbc.co.uk/mediaselector/6/select/version/2.0/mediaset/pc/vpid/bbc_one_london/format/json/jsfunc/JS_callbacks0" 2>/dev/null || echo "0")"
+
+    if [[ ! -s "$body_file" ]]; then
+        print_unlock_result "BBC iPlayer" "检测失败" "网络连接失败" "$time_total"
+    elif grep -Eqi 'geolocation' "$body_file"; then
+        print_unlock_result "BBC iPlayer" "未解锁" "服务返回地理限制" "$time_total"
+    elif grep -Eqi 'vs-hls-push-uk' "$body_file"; then
+        print_unlock_result "BBC iPlayer" "已解锁" "英国 HLS 可用" "$time_total"
+    else
+        print_unlock_result "BBC iPlayer" "检测失败" "未获取 BBC 地区字段" "$time_total"
+    fi
     rm -f "$body_file"
 }
 
@@ -261,15 +371,13 @@ test_streaming_unlock() {
 
     echo "==== 主流流媒体解锁测试 ===="
     show_test_source
-    echo "说明: YouTube Music 通过页面区域/受限标记判断；其余为连通性初筛，账号内容仍需实际播放复核。"
-    printf "%-22s %-8s %-24s %s\n" "服务" "状态码" "结果" "耗时"
+    echo "说明: 仅依据平台返回的地区、可用或受限字段判断；HTTP 状态码不参与解锁结论。"
+    printf "%-22s %-14s %-28s %s\n" "服务" "解锁结论" "地区/详情" "耗时"
     test_youtube_music_unlock
-    http_probe "YouTube Premium" "https://www.youtube.com/premium"
-    http_probe "Netflix（初筛）" "https://www.netflix.com/title/81215567"
-    http_probe "Disney+（初筛）" "https://www.disneyplus.com/"
-    http_probe "Prime Video（初筛）" "https://www.primevideo.com/"
-    http_probe "Spotify（初筛）" "https://www.spotify.com/"
-    http_probe "TikTok（初筛）" "https://www.tiktok.com/"
+    test_youtube_premium_unlock
+    test_netflix_unlock
+    test_spotify_unlock
+    test_bbc_iplayer_unlock
 }
 
 test_ai_unlock() {
